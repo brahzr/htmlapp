@@ -1,0 +1,15 @@
+# DocToDeck: pinned dependencies (Python 3.11+). Licence of each package in the comment.
+# All packages and their dependencies are permissive (MIT/BSD/Apache), no GPL/AGPL. One exception:
+# certifi (MPL-2.0, file-level copyleft), pulled in by requests and streamlit; using it unmodified is fine.
+streamlit==1.67.0        # Apache-2.0  (also installs pandas, pyarrow, altair, ...: BSD/Apache/MIT)
+pydantic==2.14.3         # MIT
+jinja2==3.1.6            # BSD-3-Clause
+markupsafe==3.0.4        # BSD-3-Clause
+python-docx==1.2.0       # MIT  (uses lxml: BSD-3-Clause)
+python-pptx==1.0.2       # MIT
+pdfplumber==0.11.10      # MIT  (uses pdfminer.six: MIT, pypdfium2: Apache-2.0 or BSD-3-Clause)
+beautifulsoup4==4.15.0   # MIT
+nh3==0.3.8               # MIT
+pillow==13.0.0           # MIT-CMU (HPND)
+requests==2.34.2         # Apache-2.0
+pandas==3.1.1            # BSD-3-Clause (already required by streamlit; used by the table editor)
