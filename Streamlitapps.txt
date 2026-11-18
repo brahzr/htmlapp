@@ -1,0 +1,797 @@
+# ═══════════════════ PART A — PROJECT BRIEF (paste once) ═══════════════════
+
+## 0. Assumptions (edit before use)
+- Audience: [teachers, trainers, students; non-technical users]
+- Deployment: [Streamlit Community Cloud; may become a public service]
+- Languages: [English + French + Arabic; Arabic requires RTL]
+- AI: [free providers only; app must fully work with AI disabled]
+- Licensing: [permissive licenses only (MIT/BSD/Apache); NO AGPL/GPL deps
+  unless I explicitly approve]
+
+## 1. Role & required expertise
+Act as a senior Python engineer and product designer with proven expertise in:
+- Python 3.11+ packaging, type hints, Pydantic v2 (discriminated unions)
+- Streamlit internals: rerun model, st.session_state, caching, components
+- Document parsing: pdfplumber, pypdf, python-docx, python-pptx, BeautifulSoup
+- HTML security: sanitization with nh3, XSS prevention
+- Presentation rendering: reveal.js + Jinja2, self-contained offline export
+- LLM integration: structured JSON output, schema validation, retries,
+  chunking, prompting small/free models, OpenAI-compatible APIs, Ollama
+- UX for non-technical users; accessibility; Arabic/RTL typography
+- Testing with pytest (fixtures, golden files); open-source license compliance
+
+## 2. Product goal
+Build "DocToDeck": a Streamlit app that converts static documents
+(DOCX, PDF, HTML, PPTX) into editable, interactive HTML presentations.
+Users upload a file, edit the resulting deck in the app, accept or reject
+AI suggestions, and export ONE self-contained .html file that works offline.
+Success = a non-technical teacher turns a 20-page DOCX into a clean,
+presentable deck in under 10 minutes without reading documentation.
+
+## 3. Fixed architecture (do not change without asking)
+Upload → Parser → Deck (single source of truth) → Renderer → Preview/Export
+                         ↑
+           Edit operations (from UI or AI), with undo/redo history
+
+All features operate ONLY on the Deck model. Parsers never render;
+the renderer never parses.
+
+## 4. Deck schema (use exactly; extend only via schema_version bump)
+```python
+from typing import Annotated, Literal, Union
+from uuid import uuid4
+from pydantic import BaseModel, Field
+
+def _id() -> str:
+    return uuid4().hex[:8]
+
+class _Block(BaseModel):
+    id: str = Field(default_factory=_id)
+
+class TextBlock(_Block):
+    type: Literal["text"] = "text"
+    text: str
+
+class BulletsBlock(_Block):
+    type: Literal["bullets"] = "bullets"
+    items: list[str]
+    fragments: bool = False          # reveal items one by one
+
+class ImageBlock(_Block):
+    type: Literal["image"] = "image"
+    src: str                          # data URI
+    alt: str = ""
+    caption: str = ""
+
+class TableBlock(_Block):
+    type: Literal["table"] = "table"
+    headers: list[str]
+    rows: list[list[str]]
+
+class ChartBlock(_Block):
+    type: Literal["chart"] = "chart"
+    chart_type: Literal["bar", "line", "pie"]
+    labels: list[str]
+    series: dict[str, list[float]]
+    source_table_id: str | None = None
+
+class CodeBlock(_Block):
+    type: Literal["code"] = "code"
+    language: str = "python"
+    code: str
+
+class QuoteBlock(_Block):
+    type: Literal["quote"] = "quote"
+    text: str
+    source: str = ""
+
+class QuizBlock(_Block):
+    type: Literal["quiz"] = "quiz"
+    question: str
+    options: list[str]
+    answer_index: int
+
+Block = Annotated[
+    Union[TextBlock, BulletsBlock, ImageBlock, TableBlock, ChartBlock,
+          CodeBlock, QuoteBlock, QuizBlock],
+    Field(discriminator="type"),
+]
+
+class Slide(BaseModel):
+    id: str = Field(default_factory=_id)
+    title: str = ""
+    layout: Literal["title", "section", "title_bullets",
+                    "two_column", "image_focus"] = "title_bullets"
+    blocks: list[Block] = []
+    notes: str = ""
+    source_ref: str | None = None     # e.g. "page 3" / "heading 2.1"
+
+class Theme(BaseModel):
+    name: str = "clean"
+    font_heading: str = "Inter"
+    font_body: str = "Inter"
+    primary_color: str = "#1F4E79"
+    background: str = "#FFFFFF"
+    direction: Literal["ltr", "rtl"] = "ltr"
+
+class Deck(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
+    title: str
+    language: str = "en"
+    theme: Theme = Theme()
+    transition: Literal["none", "fade", "slide", "convex"] = "slide"
+    slides: list[Slide] = []
+```
+
+## 5. Edit operations (UI and AI both use these; AI NEVER returns a full deck)
+```python
+class EditOp(BaseModel):
+    op: Literal["update_title", "rewrite_block", "add_block", "delete_block",
+                "split_slide", "merge_slides", "move_slide", "delete_slide",
+                "change_layout", "set_notes", "table_to_chart", "add_quiz"]
+    slide_id: str
+    target_id: str | None = None      # block id or second slide id
+    payload: dict = {}                # define a typed payload model per op
+    rationale: str = ""               # shown to the user next to the suggestion
+
+class Suggestion(BaseModel):
+    summary: str
+    ops: list[EditOp]
+```
+Each op = a pure function `apply(deck, op) -> Deck` that never mutates
+its input. History = a list of Deck snapshots in session_state (max 50).
+
+## 6. UI layout
+```
+┌ Sidebar ─────────────┬ Main ─────────────────────────────────────┐
+│ 1. Upload file       │ ┌ Slide editor ────┐ ┌ Live preview ─────┐ │
+│ 2. Slide list        │ │ title, blocks,   │ │ reveal.js iframe  │ │
+│    (↑ ↓ dup del)     │ │ layout, notes    │ │ current slide     │ │
+│ 3. Theme & transition│ └──────────────────┘ └───────────────────┘ │
+│ 4. AI settings + key │ ┌ AI suggestions ────────────────────────┐ │
+│ 5. Undo / Redo       │ │ before → after │ Accept │ Reject │ Edit│ │
+│ 6. Export / Save     │ └────────────────────────────────────────┘ │
+└──────────────────────┴───────────────────────────────────────────┘
+```
+
+## 7. Parsing rules & hard cases
+- Segmentation: new slide at H1/H2 (or detected heading font size);
+  split when a slide exceeds 6 bullets or ~60 words.
+- Multi-column PDFs: detect columns from word x-positions; read left→right.
+- Footnotes/page numbers/headers: strip repeated text; footnotes → notes.
+- Equations & complex figures: keep as cropped images.
+- Scanned PDFs (no text layer): detect and warn; OCR is Phase 2.
+- HTML: sanitize with nh3; drop scripts, iframes, event handlers.
+- Every slide keeps source_ref so users can trace content back.
+
+## 8. AI suggestion engine
+- Provider interface with 3 implementations: Ollama (local),
+  OpenAI-compatible (covers Groq, OpenRouter, HF router), Gemini.
+- User enters the key in the sidebar; keys live in session only.
+- Send ONE slide (plus deck outline) per request, never the full deck.
+- Output must validate as `Suggestion`; on invalid JSON retry 2x with the
+  validation error appended, then show a clear error. Timeouts: 30 s.
+- Never apply changes silently; always show before/after.
+
+## 9. Quality evaluation (measured, not guessed)
+On 3 fixture documents, report:
+- Content coverage: ≥ 95% of source words appear in the deck
+- Density: ≥ 90% of slides within the 6-bullet / 60-word limits
+- AI validity: ≥ 90% of AI responses validate on first or second attempt
+- Parse time per fixture (report it; flag anything > 15 s)
+
+## 10. Engineering rules
+- Modular package; no file > 300 lines; no TODOs or placeholders in code
+- Pin versions in requirements.txt; list each dependency's license
+- If unsure of a library API, say so; never invent functions
+- Explain any trade-off you make in 1–2 lines
+
+## 11. Working protocol (strict)
+For EACH stage: (1) restate the stage goal in ≤ 5 bullets, (2) list
+assumptions, (3) ask ≤ 5 questions, then STOP and wait for my answers.
+After approval: deliver folder tree → code file by file → tests →
+test results and quality metrics → known limitations.
+
+# ═══════════════════ PART B — STAGE PROMPTS (one at a time) ═══════════════════
+
+## STAGE 1 — Foundation (no parsing, no UI, no AI)
+Implement: core/schema.py, core/ops.py, core/history.py,
+render/renderer.py + Jinja2 reveal.js template + 5 themes, offline export.
+Include examples/sample_deck.json (hand-written, 8 slides, all block types,
+one RTL Arabic variant).
+Done when: sample deck exports to one .html file that opens offline with
+no console errors; RTL renders correctly; every op has passing unit tests.
+
+## STAGE 2 — Parsers
+Implement in this order: DOCX → PDF → HTML → PPTX, plus segment.py.
+Use the rules in section 7. Provide fixtures for each format.
+Done when: every fixture parses into a valid Deck, meets the coverage and
+density targets in section 9, and parse times are reported.
+
+## STAGE 3 — Streamlit app + AI
+Implement the UI exactly as in section 6, then the AI engine from section 8.
+Done when: all editing actions work and update the preview; undo/redo works;
+the app runs end-to-end with AI disabled; AI suggestions show before/after
+with Accept/Reject/Edit; AI validity is measured on the fixtures;
+README covers setup, deployment to Streamlit Cloud, and adding a provider.
+
+___________
+
+# ═══════════════════ PART A — PROJECT BRIEF (paste once) ═══════════════════
+
+## 0. Assumptions (edit before use)
+- Audience: [data scientists, analysts, Master students; intermediate level]
+- Deployment: [Streamlit Community Cloud first; may become a public service]
+- Data size: [up to 200 MB / 1M rows; heavy plots auto-sample above 50k rows]
+- Formats: [CSV, XLSX, Parquet, JSON]
+- Languages: [English UI; French optional]
+- DL framework: [PyTorch, CPU-only]
+- AI: [free providers only; app must fully work with AI disabled]
+- Licensing: [permissive only (MIT/BSD/Apache); NO AGPL/GPL deps
+  unless I explicitly approve]
+
+## 1. Role & required expertise
+Act as a senior Python engineer, data scientist and econometrician with
+proven expertise in:
+- Python 3.11+, Pydantic v2, modular packaging, type hints
+- Streamlit internals: rerun model, st.session_state, caching, multipage nav
+- pandas, NumPy, SciPy; data cleaning and missing-data theory (MCAR/MAR/MNAR)
+- Statistics & econometrics with statsmodels: estimators, robust covariance,
+  EViews-style diagnostic testing and interpretation
+- scikit-learn Pipelines/ColumnTransformer, CV, hyperparameter search,
+  leakage prevention; XGBoost/LightGBM
+- PyTorch for tabular deep learning (MLP), training loops, early stopping
+- Visualization with Plotly; SciPy hierarchical clustering
+- LLM integration: tool/function calling, JSON validation, grounding,
+  hallucination prevention, Ollama and OpenAI-compatible APIs
+- Dashboard UX, reproducibility (code export), pytest, license compliance
+
+## 2. Product goal
+Build "DataLab": a Streamlit app where a user uploads a dataset, selects
+target and features, then moves through a guided workflow:
+Data → Cleaning → EDA → Modelling → Predict → Dashboard → AI Assistant.
+Every action is previewed before applying, logged, undoable, and exportable
+as a reproducible Python script / Jupyter notebook.
+Success = an analyst goes from raw CSV to a validated model, diagnostics,
+predictions and a shareable dashboard in under 30 minutes without code.
+
+## 3. Fixed architecture (do not change without asking)
+Upload → DataFrame + ProjectState (single source of truth)
+       → Step log (cleaning/preprocessing) → Model runs → Predictions
+       → DashboardSpec → Export (HTML dashboard, .py, .ipynb)
+All pages read/write ONLY ProjectState. Business logic lives in a pure
+Python package (no Streamlit imports); the UI layer only calls it.
+
+## 4. Core state model (use exactly; extend only via schema_version bump)
+```python
+from typing import Literal
+from pydantic import BaseModel, Field
+from uuid import uuid4
+
+def _id() -> str:
+    return uuid4().hex[:8]
+
+Task = Literal["regression", "binary", "multiclass", "timeseries"]
+
+class Step(BaseModel):
+    id: str = Field(default_factory=_id)
+    kind: Literal["drop_duplicates", "drop_rows", "drop_columns", "cast_type",
+                  "impute", "outlier_treatment", "transform"]
+    columns: list[str] = []
+    params: dict = {}
+    # pre_split: deterministic row/column ops applied once to the full data
+    # in_pipeline: learned ops (impute, cap, scale) refit on TRAIN folds only
+    stage: Literal["pre_split", "in_pipeline"]
+
+class PreprocessConfig(BaseModel):
+    scaler: Literal["none", "standard", "minmax", "robust", "maxabs",
+                    "quantile", "power_yeojohnson", "log1p"] = "standard"
+    encoder: Literal["onehot", "ordinal", "target"] = "onehot"
+    test_size: float = 0.2
+    cv: Literal["kfold", "stratified", "timeseries"] = "kfold"
+    n_splits: int = 5
+    random_state: int = 42
+
+class ModelRun(BaseModel):
+    id: str = Field(default_factory=_id)
+    family: Literal["classic", "ml", "dl"]
+    name: str
+    params: dict = {}
+    metrics: dict[str, float] = {}
+    diagnostics: dict = {}            # classic models only
+    artifact_path: str | None = None
+
+class Widget(BaseModel):
+    id: str = Field(default_factory=_id)
+    kind: Literal["kpi", "chart", "table", "metrics", "importance",
+                  "predict_form", "text"]
+    config: dict = {}
+    position: tuple[int, int] = (0, 0)   # grid row, col
+    width: int = 6                        # of 12 columns
+
+class DashboardSpec(BaseModel):
+    title: str = "Dashboard"
+    filters: list[str] = []               # columns used as live filters
+    widgets: list[Widget] = []
+
+class ProjectState(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
+    dataset_name: str
+    target: str | None = None
+    features: list[str] = []
+    task: Task | None = None
+    datetime_col: str | None = None
+    steps: list[Step] = []
+    preprocess: PreprocessConfig = PreprocessConfig()
+    runs: list[ModelRun] = []
+    dashboard: DashboardSpec = DashboardSpec()
+```
+
+## 5. Page specifications
+
+### 5.1 Data
+- Upload, preview, dtype inference with user override, memory usage
+- Select target + features (default: all except target and ID-like columns)
+- Auto-detect task from target (user can override); detect datetime column
+- Pages after this one are locked until a target is chosen
+
+### 5.2 Cleaning (each action: preview before/after → Apply → logged → undo)
+Outliers
+- Detection methods: IQR/boxplot (k adjustable, default 1.5), z-score,
+  modified z-score (MAD), Isolation Forest (multivariate)
+- Per-column boxplot with outliers highlighted; count and % per column
+- Treatments: remove rows, cap/winsorize at bounds, replace with median,
+  log/Yeo-Johnson transform, flag column, keep
+Missing values
+- Table of count/% per column + missingness matrix plot
+- Treatments: drop rows, drop columns above threshold %, mean, median, mode,
+  constant, forward/back fill (time series), KNN imputer, iterative imputer
+- Rule: if a column has outliers, recommend median (not mean) and explain why
+Duplicates
+- Exact duplicates and duplicates on a chosen column subset
+- Treatments: keep first, keep last, drop all
+Data quality score (0–100) shown before and after cleaning.
+
+### 5.3 EDA
+- Summary statistics: count, mean, std, min, quartiles, max, skewness,
+  kurtosis, missing %, unique; grouped by a chosen categorical column
+- Distributions: histogram + KDE, boxplot, violin, QQ-plot
+- Relationships: scatter vs target, pairplot (sampled), grouped bar charts
+- Correlation (heatmap for each, with clustered ordering option):
+  Pearson, Spearman, Kendall (num–num); point-biserial (binary–num);
+  Cramér's V (cat–cat); correlation ratio η (cat–num); mutual information
+  with target; partial correlation
+- Trees & hierarchy: feature dendrogram (distance = 1 − |corr|),
+  observation dendrogram (sampled), shallow decision tree explaining the
+  target (max_depth 3–4), treemap of categorical composition
+- Time series (if datetime_col): line plot, rolling mean, seasonal
+  decomposition, ACF/PACF
+- Auto-generated plain-language insights (e.g. "x1 and x2 correlate 0.92:
+  multicollinearity risk")
+
+### 5.4 Modelling
+Common preprocessing panel: scaler, encoder, split, CV (from PreprocessConfig).
+All learned steps go inside a scikit-learn Pipeline fit on train only.
+
+Classic (statsmodels)
+- Estimators: OLS, WLS, GLS, Robust (RLM), Quantile regression, 2SLS/IV,
+  Logit, Probit, Multinomial Logit, Poisson, Negative Binomial,
+  ARIMA/SARIMAX (time series)
+- Covariance options: nonrobust, HC0–HC3, HAC (Newey-West)
+- Output in EViews-style table: coefficient, std error, t/z, p-value,
+  R², adj. R², F-stat, AIC, BIC, log-likelihood, Durbin-Watson
+- Diagnostics (each shows H0, statistic, p-value, verdict at chosen α,
+  and a plain-language recommendation):
+  Normality: Jarque-Bera, residual histogram, QQ-plot
+  Serial correlation: Durbin-Watson, Breusch-Godfrey LM, Ljung-Box Q,
+  residual correlogram
+  Heteroskedasticity: Breusch-Pagan, White, ARCH LM
+  Specification: Ramsey RESET
+  Multicollinearity: VIF, condition number
+  Stability: Chow breakpoint (user picks break), CUSUM
+  Coefficient tests: Wald restrictions (user-entered, e.g. "x1 = x2")
+  Stationarity (time series): ADF, KPSS
+  Example recommendation: "Heteroskedasticity detected → refit with HC3"
+
+Machine learning (scikit-learn, XGBoost, LightGBM)
+- Regression: Linear, Ridge, Lasso, ElasticNet, KNN, SVR, Decision Tree,
+  Random Forest, Extra Trees, Gradient Boosting, HistGB, XGBoost, LightGBM
+- Classification: Logistic, KNN, SVC, Naive Bayes, Decision Tree,
+  Random Forest, Extra Trees, Gradient Boosting, HistGB, XGBoost, LightGBM
+- Hyperparameters in UI with sensible defaults; optional Grid/Random search
+- Class imbalance: class_weight option; stratified CV
+
+Deep learning (PyTorch MLP)
+- Architecture: number of layers, units per layer, dropout, batch norm
+- Activation: ReLU, LeakyReLU, ELU, SELU, GELU, Tanh, Sigmoid
+- Optimizer: SGD (+momentum), Adam, AdamW, RMSprop, Adagrad
+- Learning rate, batch size, epochs, weight decay, early stopping patience
+- Loss chosen automatically from task (MSE / BCE / CrossEntropy)
+- Live training/validation loss curve; seed control for reproducibility
+
+Evaluation (all families)
+- Regression: MAE, RMSE, R², MAPE; residual plots
+- Classification: accuracy, precision, recall, F1, ROC-AUC, PR-AUC,
+  confusion matrix, ROC curve, calibration curve
+- Explainability: coefficients, feature importance, permutation importance
+- Leaderboard comparing all runs; mark best by chosen metric
+
+### 5.5 Predict
+- Choose a fitted run
+- Single prediction: auto-generated input form from feature types/ranges
+- Batch prediction: upload new file, validate schema, apply same pipeline
+- Output: predictions, class probabilities, prediction intervals (OLS)
+- Warn when inputs fall outside the training range; download as CSV
+
+### 5.6 Dashboard
+- User picks widgets: KPI cards, any EDA chart, model metrics, leaderboard,
+  feature importance, prediction form, text notes
+- 12-column grid layout; reorder and resize
+- Live filters on chosen columns update every widget
+- Save/load DashboardSpec as JSON; export standalone interactive HTML
+
+### 5.7 AI Assistant (grounded, never hallucinating numbers)
+- Chat panel that answers questions about the user's dataset and models
+- The LLM NEVER computes numbers itself. It calls a fixed set of tools with
+  JSON arguments validated by Pydantic; tools run deterministic pandas /
+  statsmodels code and return results:
+  describe_column, value_counts, groupby_aggregate, correlation,
+  filter_count, missing_report, outlier_report, run_test,
+  compare_runs, explain_run, make_chart (returns a Plotly spec)
+- Every number in an answer must come from a tool result; show
+  "computed from: tool + args" under each answer
+- Can propose next steps and add a suggested chart to the dashboard
+  (user confirms)
+- Privacy: by default send only schema + aggregated stats, never raw rows;
+  raw-row sharing is opt-in; Ollama local option for sensitive data
+- Providers: Ollama, OpenAI-compatible (Groq, OpenRouter, HF router), Gemini;
+  key in sidebar, stored in session only; 30 s timeout, 2 retries
+
+## 6. Reproducibility
+- "Export code" generates a runnable .py and .ipynb reproducing the
+  cleaning steps, preprocessing, chosen model and evaluation exactly
+- Global random_state applied to splits, models and PyTorch
+
+## 7. Quality evaluation (measured, not guessed)
+- Numerical accuracy: OLS on the NIST Longley dataset matches certified
+  coefficients to ≥ 7 significant digits
+- Diagnostics: each test matches a direct statsmodels call on fixtures
+- Leakage test: a pipeline test proving imputers/scalers are fit on train only
+- ML sanity: scikit-learn diabetes and breast cancer datasets reach
+  documented baseline metrics
+- Assistant: on 20 scripted questions, 100% of numbers trace to tool calls;
+  ≥ 90% of tool calls validate on first or second attempt
+- Performance: report load + EDA time on a 100k × 30 synthetic dataset
+
+## 8. Engineering rules
+- Package layout: core/, cleaning/, eda/, models/{classic,ml,dl}/,
+  predict/, dashboard/, assistant/, export/, ui/pages/
+- No file > 300 lines; no TODOs or placeholders in delivered code
+- Pin versions in requirements.txt; list each dependency's license
+- Cache heavy computations with st.cache_data / st.cache_resource
+- Only load model artifacts the app created itself (no untrusted pickles)
+- If unsure of a library API, say so; never invent functions
+- Explain any trade-off in 1–2 lines
+
+## 9. Working protocol (strict)
+For EACH stage: (1) restate the stage goal in ≤ 5 bullets, (2) list
+assumptions, (3) ask ≤ 5 questions, then STOP and wait for my answers.
+After approval: deliver folder tree → code file by file → tests →
+test results and metrics from section 7 → known limitations.
+
+# ═══════════════════ PART B — STAGE PROMPTS (one at a time) ═══════════════════
+
+## STAGE 1 — Foundation + Data page
+Implement ProjectState, step log with undo/redo, data loading, dtype
+inference, target/feature selection, task detection, page navigation with
+locking, and the code-export skeleton.
+Done when: all 4 formats load; task detection is correct on fixtures;
+state saves/loads as JSON; undo/redo tests pass.
+
+## STAGE 2 — Cleaning
+Implement section 5.2 with previews, logging and the pre_split /
+in_pipeline separation.
+Done when: every treatment has unit tests; median recommendation triggers
+when outliers exist; data quality score updates; exported code reproduces
+the cleaned data exactly.
+
+## STAGE 3 — EDA
+Implement section 5.3 with automatic sampling for heavy plots.
+Done when: every correlation type matches a reference SciPy/pandas
+computation; plots render on the 100k-row dataset; insights are generated.
+
+## STAGE 4 — Preprocessing + Classic econometrics
+Implement the preprocessing panel and classic models with all diagnostics.
+Done when: Longley accuracy target is met; every diagnostic matches
+statsmodels; recommendations appear for failed tests.
+
+## STAGE 5 — Machine learning + Deep learning
+Implement ML and DL modelling, evaluation, explainability and leaderboard.
+Done when: leakage test passes; baseline metrics are reached; DL runs are
+reproducible with a fixed seed; live loss curve works.
+
+## STAGE 6 — Predict + Dashboard
+Implement sections 5.5 and 5.6.
+Done when: batch predictions match in-app predictions exactly; out-of-range
+warnings work; dashboard filters update all widgets; exported HTML opens
+offline.
+
+## STAGE 7 — AI Assistant
+Implement section 5.7.
+Done when: the app works fully with AI disabled; all scripted-question
+targets in section 7 are met; privacy default is verified by a test that
+inspects the outgoing payload.
+
+_______
+
+# ═══════════════════ PART A — PROJECT BRIEF (paste once) ═══════════════════
+
+## 0. Assumptions (edit before use)
+- Audience: [PhD students, researchers, supervisors in higher education]
+- Disciplines: [all; first tuned for data science, economics, engineering]
+- Deployment: [Streamlit Community Cloud first; may become a public service]
+- Languages: [queries and answers in English, French, Arabic; sources
+  mostly English]
+- Default literature window: [last 5 years, user-adjustable]
+- AI: [free providers only; retrieval must work with AI disabled]
+- Licensing: [permissive code deps only (MIT/BSD/Apache); respect each data
+  source's terms of use, rate limits and robots.txt]
+
+## 1. Role & required expertise
+Act as a senior Python engineer, information-retrieval specialist and
+research methodologist with proven expertise in:
+- Python 3.11+, Pydantic v2, asyncio/httpx, modular packaging, type hints
+- Scholarly APIs: OpenAlex, Semantic Scholar, Crossref, arXiv, PubMed
+  (E-utilities), CORE, DOAJ, DataCite, Zenodo, Hugging Face Hub, OpenML
+- Retrieval-augmented generation: query expansion, hybrid ranking
+  (BM25 + embeddings), re-ranking, deduplication, citation grounding
+- Hallucination prevention: evidence-ID citation, output validation
+- Author disambiguation (ORCID, OpenAlex IDs), bibliometrics
+  (citations, h-index, field-normalized metrics)
+- Research methodology: framing research problems, gaps, research
+  questions, hypotheses, method selection, journal targeting
+- Ethical web data collection (robots.txt, ToS, caching, polite rate limits)
+- Streamlit chat UI, caching (SQLite/DuckDB), exports (BibTeX, RIS, DOCX)
+- pytest with recorded API fixtures; license and terms-of-use compliance
+
+## 2. Product goal
+Build "ResearchCompass": a research assistant chatbot (similar in spirit
+to Consensus and Perplexity) for higher-education researchers. The user
+enters a topic or keywords; the app retrieves REAL scholarly records and
+returns a structured Research Brief: proposed titles, research problem and
+gaps, recent literature, key authors, methods/models, datasets, target
+journals and open special issues, every item linked to a verifiable source.
+Success = a PhD student gets a trustworthy, fully cited starting brief on a
+new topic in under 2 minutes, with zero fabricated references.
+
+## 3. Non-negotiable trust rules
+1. The LLM NEVER produces a paper, author, journal, dataset, DOI, metric or
+   special issue from memory. All such items come from retrieved records.
+2. Every LLM-written sentence that makes a claim cites evidence IDs
+   ([E12]) from the evidence store; a validator rejects unknown IDs.
+3. Tables are built deterministically from metadata; the LLM writes only
+   prose fields (summaries, gap statements, rationales).
+4. Every DOI is verified to resolve before display.
+5. When nothing is found, say "not found" — never fill gaps.
+6. Clearly label: Retrieved (from source) vs. Suggested (AI-generated,
+   e.g. titles) vs. Verify (scraped, time-sensitive, e.g. special issues).
+7. Show the source and retrieval date for every item.
+
+## 4. Fixed architecture (do not change without asking)
+Query → Understanding (language, discipline, intent) → Keyword expansion
+(synonyms, related concepts; user can edit) → Parallel retrieval from
+sources → Normalize + deduplicate (DOI > title+year fuzzy match) →
+Rank (relevance + recency + citations) → Evidence store (IDs) →
+LLM synthesis restricted to evidence → Citation validator →
+Research Brief (sections + tables) → Follow-up chat → Export
+
+## 5. Data models (use exactly; extend only via schema_version bump)
+```python
+from datetime import date
+from typing import Literal
+from pydantic import BaseModel, HttpUrl
+
+Origin = Literal["retrieved", "suggested", "verify"]
+
+class Paper(BaseModel):
+    evidence_id: str                  # e.g. "E12"
+    title: str
+    authors: list[str]
+    year: int
+    venue: str | None = None
+    doi: str | None = None
+    url: HttpUrl | None = None
+    abstract: str | None = None
+    citations: int | None = None
+    open_access: bool | None = None
+    methods: list[str] = []           # extracted from abstract
+    datasets: list[str] = []          # extracted from abstract
+    source: str                       # "openalex", "semantic_scholar", ...
+    retrieved_on: date
+
+class Author(BaseModel):
+    name: str
+    openalex_id: str | None = None
+    orcid: str | None = None
+    affiliation: str | None = None
+    country: str | None = None
+    works_in_topic: int
+    total_citations: int | None = None
+    h_index: int | None = None
+    top_paper_ids: list[str] = []     # evidence IDs
+    profile_url: HttpUrl | None = None
+
+class Journal(BaseModel):
+    name: str
+    publisher: str | None = None
+    issn: list[str] = []
+    in_doaj: bool | None = None
+    open_access: bool | None = None
+    apc_usd: float | None = None
+    mean_citedness_2y: float | None = None   # NOT Impact Factor; label it
+    topic_papers: int                         # topic papers it published
+    example_paper_ids: list[str] = []
+    fit_score: float                          # 0–1, explained in UI
+    scope_url: HttpUrl | None = None
+
+class SpecialIssue(BaseModel):
+    title: str
+    journal: str
+    deadline: date | None = None
+    guest_editors: list[str] = []
+    url: HttpUrl
+    retrieved_on: date
+    status: Literal["open", "closed", "unknown"]
+    origin: Origin = "verify"
+
+class Dataset(BaseModel):
+    name: str
+    source: str                       # zenodo, huggingface, openml, ...
+    url: HttpUrl
+    license: str | None = None
+    size: str | None = None
+    used_in_paper_ids: list[str] = []
+
+class Claim(BaseModel):
+    text: str
+    evidence_ids: list[str]           # must be non-empty and valid
+
+class ResearchBrief(BaseModel):
+    schema_version: Literal["1.0"] = "1.0"
+    query: str
+    keywords: list[str]
+    overview: list[Claim]
+    titles: list[str]                 # origin = suggested
+    problem_statement: list[Claim]
+    gaps: list[Claim]
+    research_questions: list[str]
+    hypotheses: list[str]
+    papers: list[Paper]
+    authors: list[Author]
+    methods: list[dict]               # method, frequency, paper_ids, when_to_use, python_lib
+    datasets: list[Dataset]
+    journals: list[Journal]
+    special_issues: list[SpecialIssue]
+    next_steps: list[str]
+```
+
+## 6. Research Brief sections (output for every query)
+1. Topic overview: 4–6 cited sentences on the state of the field
+2. Proposed titles: 5 options (empirical, methodological, comparative,
+   applied, review), labelled Suggested
+3. Research problem: problem statement, 3–5 gaps derived from limitations
+   and future-work statements in retrieved papers, research questions and
+   testable hypotheses; each gap cited
+4. Recent literature table: title, authors, year, venue, citations,
+   method, one-line key finding, open access, DOI link; sortable,
+   filterable by year/citations/OA
+5. Key authors table: name, affiliation, country, ORCID, topic works,
+   total citations, h-index, top paper, profile link
+6. Methods & models table: method, how often used in retrieved papers,
+   example papers, when to use, Python library
+7. Datasets table: name, source, license, size, papers using it, link
+8. Target journals table: name, publisher, ISSN, DOAJ, OA/APC,
+   2-year mean citedness (labelled "not Impact Factor"), topic papers
+   published, fit score with explanation, scope link
+9. Special issues table: title, journal, deadline, guest editors, status,
+   retrieved date, link; past deadlines hidden by default
+10. Next steps: reading order, a suggested first experiment, journals to check
+
+## 7. Retrieval & ranking
+- Query expansion: LLM proposes synonyms/related terms; show them as
+  editable chips before searching (works without AI using the raw query)
+- Sources: OpenAlex + Semantic Scholar + Crossref (core), arXiv and PubMed
+  (discipline-dependent), CORE (open-access full text)
+- Ranking score = relevance (hybrid BM25 + embedding similarity)
+  + recency weight + log(citations), weights configurable
+- Separate "Seminal works" (highly cited, any year) from "Recent works"
+- Author ranking: topic works × citation impact within the topic,
+  disambiguated by OpenAlex ID / ORCID
+- Journal fit: share of topic papers published + embedding similarity
+  between topic and journal scope
+- Datasets: Zenodo, DataCite, Hugging Face Hub, OpenML + dataset mentions
+  extracted from retrieved abstracts
+- Special issues: fetch publisher call-for-papers pages (e.g. MDPI,
+  Springer, Elsevier, Frontiers, IEEE) only where robots.txt and terms
+  allow; cache 24 h; parse deadlines; support a manually curated list
+- Verify current auth, rate limits and terms for every API at build time;
+  use polite headers (mailto) and exponential backoff
+
+## 8. Chat behaviour
+- After the Brief, users can ask follow-ups ("compare method A vs B",
+  "only papers from Africa", "papers since 2024", "explain gap 2")
+- Follow-ups reuse the evidence store and retrieve more when needed
+- Consensus mode for yes/no research questions: classify each relevant
+  paper as supports / contradicts / mixed / unclear, show a distribution
+  bar with counts and the cited papers behind each class
+- Answer in the user's query language; keep titles in original language
+- Students may not use the app to write full papers: it helps with
+  framing, discovery and planning, and says so in the UI
+
+## 9. Exports & persistence
+- Export Brief as Markdown, DOCX and PDF; references as BibTeX, RIS, CSV
+- Save sessions (query, evidence store, brief) locally in SQLite
+- Saved searches with "what's new since last time" refresh
+
+## 10. Quality evaluation (measured, not guessed)
+- Citation validity: 100% of displayed DOIs resolve; 0 fabricated items on
+  a 30-query adversarial test set (obscure or non-existent topics included)
+- Grounding: 100% of Claims carry valid evidence IDs (validator test)
+- Recall: on a gold set of 10 topics with 5 known key papers each
+  (provided by me), ≥ 80% appear in the top 30 results
+- Author disambiguation: spot-check 20 authors; report error rate
+- Latency: report p50/p95 time-to-brief; target p50 < 60 s
+- Special issues: report precision of "open" status on 20 samples
+
+## 11. Engineering rules
+- Package layout: core/, sources/<one module per API>/, retrieval/,
+  ranking/, synthesis/, validation/, scrapers/, export/, ui/
+- Each source implements one interface: search(query, filters) -> list[Paper]
+- Async parallel calls with timeouts; a failing source degrades gracefully
+  and is reported in the UI
+- No file > 300 lines; no TODOs or placeholders in delivered code
+- Pin versions; list each dependency's license and each source's terms
+- API keys in sidebar or env vars only; never logged
+- If unsure of an API endpoint or field, say so; never invent one
+- Explain any trade-off in 1–2 lines
+
+## 12. Working protocol (strict)
+For EACH stage: (1) restate the stage goal in ≤ 5 bullets, (2) list
+assumptions, (3) ask ≤ 5 questions, then STOP and wait for my answers.
+After approval: deliver folder tree → code file by file → tests →
+test results and metrics from section 10 → known limitations.
+
+# ═══════════════════ PART B — STAGE PROMPTS (one at a time) ═══════════════════
+
+## STAGE 1 — Foundation + sources
+Implement data models, the source interface, connectors for OpenAlex,
+Semantic Scholar, Crossref and arXiv, SQLite cache with TTL, normalization
+and deduplication, DOI verification.
+Done when: each connector passes tests on recorded fixtures; duplicates
+across sources merge correctly; failing sources degrade gracefully.
+
+## STAGE 2 — Retrieval, ranking, literature + authors
+Implement query expansion (with no-AI fallback), hybrid ranking,
+seminal vs. recent split, the literature table and author ranking.
+Done when: the recall target is met on the gold set; author disambiguation
+is spot-checked; tables are sortable and filterable.
+
+## STAGE 3 — Grounded synthesis
+Implement the evidence store, LLM synthesis for overview, titles, problem
+statement, gaps, research questions, hypotheses, methods table, and the
+citation validator.
+Done when: 0 fabricated items on the adversarial set; 100% of Claims
+validate; invalid LLM output retries 2x, then shows a clear error.
+
+## STAGE 4 — Datasets, journals, special issues
+Implement dataset discovery, journal fit scoring, DOAJ checks and the
+special-issue scraper with ToS/robots.txt checks and deadline parsing.
+Done when: journal fit scores are explained in the UI; special-issue
+precision is reported; past deadlines are hidden by default.
+
+## STAGE 5 — Chat UI, consensus mode, exports
+Implement the Streamlit chat interface, follow-up questions, consensus
+mode, saved searches, and all exports.
+Done when: follow-ups reuse the evidence store; exports open correctly
+(BibTeX imports into Zotero); the latency report is produced; the app works
+end-to-end with AI disabled (retrieval and tables only).
